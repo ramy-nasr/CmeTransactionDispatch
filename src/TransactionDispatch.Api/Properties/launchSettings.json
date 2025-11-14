@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "TransactionDispatch.Api": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:49282;http://localhost:49283"
+    }
+  }
+}

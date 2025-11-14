@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+using Confluent.Kafka;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using TransactionDispatch.Worker.Configuration;
+
+namespace TransactionDispatch.Worker.Services;
+
+public sealed class KafkaConsumerWorker : BackgroundService
+{
+    private readonly ILogger<KafkaConsumerWorker> _logger;
+    private readonly KafkaConsumerOptions _options;
+    private IConsumer<string, byte[]>? _consumer;
+
+    public KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, ILogger<KafkaConsumerWorker> logger)
+    {
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (string.IsNullOrWhiteSpace(_options.BootstrapServers))
+        {
+            throw new InvalidOperationException("Kafka consumer bootstrap servers must be configured.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_options.Topic))
+        {
+            throw new InvalidOperationException("Kafka consumer topic must be configured.");
+        }
+
+        var groupId = string.IsNullOrWhiteSpace(_options.GroupId)
+            ? $"transaction-dispatch-worker-{Environment.MachineName}"
+            : _options.GroupId;
+
+        var config = new ConsumerConfig
+        {
+            BootstrapServers = _options.BootstrapServers,
+            GroupId = groupId,
+            EnableAutoCommit = _options.EnableAutoCommit,
+            AutoOffsetReset = AutoOffsetReset.Earliest,
+            FetchMaxBytes = _options.FetchMaxBytes > 0 ? _options.FetchMaxBytes : null
+        };
+
+        using var consumer = new ConsumerBuilder<string, byte[]>(config)
+            .SetErrorHandler((_, error) => _logger.LogError("Kafka consumer error: {Reason}", error.Reason))
+            .Build();
+
+        _consumer = consumer;
+        consumer.Subscribe(_options.Topic);
+
+        _logger.LogInformation("Kafka consumer subscribed to {Topic}", _options.Topic);
+
+        var maxDegreeOfParallelism = Math.Max(1, _options.MaxDegreeOfParallelism);
+        var inFlight = new List<Task<ProcessingOutcome>>(maxDegreeOfParallelism);
+
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                await DrainCompletedAsync(inFlight, consumer, stoppingToken);
+
+                ConsumeResult<string, byte[]>? result = null;
+
+                result = consumer.Consume(TimeSpan.FromMilliseconds(200));
+
+
+                if (result is null)
+                {
+                    continue;
+                }
+
+                if (inFlight.Count >= maxDegreeOfParallelism)
+                {
+                    await AwaitAndHandleCompletionAsync(inFlight, consumer, stoppingToken);
+                }
+
+                inFlight.Add(ProcessMessageAsync(result, stoppingToken));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            while (inFlight.Count > 0)
+            {
+                await AwaitAndHandleCompletionAsync(inFlight, consumer, stoppingToken);
+            }
+
+            consumer.Close();
+            _logger.LogInformation("Kafka consumer closed");
+        }
+    }
+
+    private async Task AwaitAndHandleCompletionAsync(
+        List<Task<ProcessingOutcome>> inFlight,
+        IConsumer<string, byte[]> consumer,
+        CancellationToken cancellationToken)
+    {
+        if (inFlight.Count == 0)
+        {
+            return;
+        }
+
+        var completed = await Task.WhenAny(inFlight);
+        inFlight.Remove(completed);
+        await HandleCompletionAsync(await completed, consumer, cancellationToken);
+    }
+
+    private async Task DrainCompletedAsync(
+        List<Task<ProcessingOutcome>> inFlight,
+        IConsumer<string, byte[]> consumer,
+        CancellationToken cancellationToken)
+    {
+        for (var index = inFlight.Count - 1; index >= 0; index--)
+        {
+            var task = inFlight[index];
+            if (!task.IsCompleted)
+            {
+                continue;
+            }
+
+            inFlight.RemoveAt(index);
+            await HandleCompletionAsync(await task, consumer, cancellationToken);
+        }
+    }
+
+    private Task<ProcessingOutcome> ProcessMessageAsync(
+        ConsumeResult<string, byte[]> result,
+        CancellationToken cancellationToken)
+    {
+        return Task.Run(async () =>
+        {
+            try
+            {
+                await HandleMessageAsync(result, cancellationToken);
+                return new ProcessingOutcome(result, null);
+            }
+            catch (OperationCanceledException)
+            {
+                return new ProcessingOutcome(result, null);
+            }
+            catch (Exception ex)
+            {
+                return new ProcessingOutcome(result, ex);
+            }
+        }, CancellationToken.None);
+    }
+
+    private async Task HandleCompletionAsync(
+        ProcessingOutcome outcome,
+        IConsumer<string, byte[]> consumer,
+        CancellationToken cancellationToken)
+    {
+        if (outcome.Exception is not null)
+        {
+            _logger.LogError(
+                outcome.Exception,
+                "Error while processing message from partition {Partition} at offset {Offset}",
+                outcome.Result.Partition,
+                outcome.Result.Offset);
+            return;
+        }
+
+        if (_options.EnableAutoCommit)
+        {
+            return;
+        }
+
+        try
+        {
+            consumer.Commit(outcome.Result);
+        }
+        catch (KafkaException ex)
+        {
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogError(ex, "Failed to commit Kafka message offset");
+            }
+        }
+    }
+
+    private Task HandleMessageAsync(ConsumeResult<string, byte[]> result, CancellationToken cancellationToken)
+    {
+        LogMessage(result);
+        return Task.CompletedTask;
+    }
+
+    private void LogMessage(ConsumeResult<string, byte[]> result)
+    {
+        var payloadSize = result.Message.Value?.Length ?? 0;
+        _logger.LogInformation(
+            "Consumed message with key {Key} from partition {Partition} at offset {Offset} ({Bytes} bytes)",
+            result.Message.Key,
+            result.Partition,
+            result.Offset,
+            payloadSize);
+    }
+
+    private sealed record ProcessingOutcome(ConsumeResult<string, byte[]> Result, Exception? Exception);
+
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        _consumer?.Close();
+        _consumer?.Dispose();
+        return base.StopAsync(cancellationToken);
+    }
+}
