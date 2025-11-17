@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Logging;
-using System.IO;
 using TransactionDispatch.Domain;
 using TransactionDispatch.Domain.Abstractions;
 using TransactionDispatch.Domain.FileSystem;
@@ -50,23 +49,7 @@ public sealed class DispatchApplicationService : IDispatchApplicationService
         var jobId = DispatchJobId.NewId();
 
         var job = new DispatchJob(jobId, command.FolderPath, command.DeleteAfterSend, allowedExtensions, idempotencyKey);
-        var added = await _repository.AddAsync(job, cancellationToken).ConfigureAwait(false);
-        if (!added)
-        {
-            if (idempotencyKey is null)
-            {
-                throw new InvalidOperationException($"Job with id {jobId} already exists.");
-            }
-
-            var existing = await _repository.GetByIdempotencyKeyAsync(idempotencyKey, cancellationToken)
-                .ConfigureAwait(false);
-            if (existing is null)
-            {
-                throw new InvalidOperationException($"Failed to add dispatch job for idempotency key '{idempotencyKey}'.");
-            }
-
-            return existing.Id;
-        }
+        await _repository.AddAsync(job, cancellationToken).ConfigureAwait(false);
 
         _ = Task.Run(() => ProcessJobAsync(job.Id, CancellationToken.None));
 
