@@ -129,7 +129,7 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
         {
             try
             {
-                await HandleMessageAsync(result, cancellationToken);
+                await ExecuteWithRetryAsync(() => HandleMessageAsync(result, cancellationToken), cancellationToken);
                 return new ProcessingOutcome(result, null);
             }
             catch (OperationCanceledException)
@@ -141,6 +141,84 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
                 return new ProcessingOutcome(result, ex);
             }
         }, CancellationToken.None);
+    }
+
+    private async Task ExecuteWithRetryAsync(Func<Task> action, CancellationToken cancellationToken)
+    {
+        var maxAttempts = Math.Max(1, _options.MaxProcessingRetries);
+        var baseDelayMs = Math.Max(0, _options.RetryBackoffMilliseconds);
+
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                await action();
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+
+                if (attempt >= maxAttempts)
+                {
+                    throw;
+                }
+
+                var delay = CalculateBackoffDelay(baseDelayMs, attempt - 1);
+
+                if (delay > TimeSpan.Zero)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Processing attempt {Attempt}/{MaxAttempts} failed. Retrying in {Delay}...",
+                        attempt,
+                        maxAttempts,
+                        delay);
+
+                    try
+                    {
+                        await Task.Delay(delay, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Processing attempt {Attempt}/{MaxAttempts} failed. Retrying immediately...",
+                        attempt,
+                        maxAttempts);
+                }
+            }
+        }
+
+        if (lastException is not null)
+        {
+            throw lastException;
+        }
+    }
+
+    private static TimeSpan CalculateBackoffDelay(int baseDelayMs, int retryNumber)
+    {
+        if (baseDelayMs <= 0)
+        {
+            return TimeSpan.Zero;
+        }
+
+        var multiplier = Math.Pow(2, Math.Max(0, retryNumber));
+        var delayMs = baseDelayMs * multiplier;
+        return TimeSpan.FromMilliseconds(Math.Min(delayMs, int.MaxValue));
     }
 
     private async Task HandleCompletionAsync(

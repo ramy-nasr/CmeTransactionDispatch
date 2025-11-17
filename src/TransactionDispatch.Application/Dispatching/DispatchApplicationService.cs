@@ -51,7 +51,7 @@ public sealed class DispatchApplicationService : IDispatchApplicationService
         var job = new DispatchJob(jobId, command.FolderPath, command.DeleteAfterSend, allowedExtensions, idempotencyKey);
         await _repository.AddAsync(job, cancellationToken).ConfigureAwait(false);
 
-        _ = Task.Run(() => ProcessJobAsync(job.Id, CancellationToken.None));
+        await ProcessJobAsync(job.Id, cancellationToken);
 
         return jobId;
     }

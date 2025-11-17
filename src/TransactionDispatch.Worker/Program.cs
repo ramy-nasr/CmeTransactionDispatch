@@ -1,6 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 using TransactionDispatch.Worker.Configuration;
 using TransactionDispatch.Worker.Services;
 
@@ -13,6 +12,8 @@ var host = Host.CreateDefaultBuilder(args)
             .Validate(options => !string.IsNullOrWhiteSpace(options.BootstrapServers), "Kafka consumer bootstrap servers must be configured.")
             .Validate(options => !string.IsNullOrWhiteSpace(options.Topic), "Kafka consumer topic must be configured.")
             .Validate(options => options.MaxDegreeOfParallelism > 0, "MaxDegreeOfParallelism must be greater than zero.")
+            .Validate(options => options.MaxProcessingRetries > 0, "MaxProcessingRetries must be at least 1.")
+            .Validate(options => options.RetryBackoffMilliseconds >= 0, "RetryBackoffMilliseconds cannot be negative.")
             .ValidateOnStart();
 
         services.AddHostedService<KafkaConsumerWorker>();

@@ -13,4 +13,7 @@ public sealed class KafkaConsumerOptions
     public int FetchMaxBytes { get; set; }
 
     public int MaxDegreeOfParallelism { get; set; } = 1;
+    public int MaxProcessingRetries { get; set; } = 3;
+
+    public int RetryBackoffMilliseconds { get; set; } = 1000;
 }
