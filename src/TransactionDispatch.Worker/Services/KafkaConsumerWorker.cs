@@ -37,8 +37,9 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
             FetchMaxBytes = _options.FetchMaxBytes > 0 ? _options.FetchMaxBytes : null
         };
 
-        using var consumer = new ConsumerBuilder<string, byte[]>(config)
-            .SetErrorHandler((_, error) => _logger.LogError("Kafka consumer error: {Reason}", error.Reason))
+        var consumer = new ConsumerBuilder<string, byte[]>(config)
+            .SetErrorHandler((_, error) =>
+                _logger.LogError("Kafka consumer error: {Reason}", error.Reason))
             .Build();
 
         _consumer = consumer;
@@ -53,38 +54,74 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                await DrainCompletedAsync(inFlight, consumer, stoppingToken);
-
-                ConsumeResult<string, byte[]>? result = null;
-
-                result = consumer.Consume(TimeSpan.FromMilliseconds(200));
-
-                if (result is null)
-                {
-                    continue;
-                }
-
                 if (inFlight.Count >= maxDegreeOfParallelism)
                 {
                     await AwaitAndHandleCompletionAsync(inFlight, consumer, stoppingToken);
                 }
 
-                inFlight.Add(ProcessMessageAsync(result, stoppingToken));
+                ConsumeResult<string, byte[]>? result = null;
+
+                try
+                {
+                    result = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                }
+                catch (ConsumeException ex)
+                {
+                    if (!stoppingToken.IsCancellationRequested)
+                    {
+                        _logger.LogError(ex, "Kafka consume error");
+                    }
+                }
+
+                if (result is null)
+                {
+                    await DrainCompletedAsync(inFlight, consumer, stoppingToken);
+                    continue;
+                }
+
+                var processingTask = ProcessMessageAsync(result, stoppingToken);
+                inFlight.Add(processingTask);
+
+                await DrainCompletedAsync(inFlight, consumer, stoppingToken);
             }
         }
         catch (OperationCanceledException ex)
         {
-            _logger.LogInformation("Kafka consumer closed {Error Message}", ex.Message);
+            _logger.LogInformation("Kafka consumer canceled: {Message}", ex.Message);
         }
         finally
         {
             while (inFlight.Count > 0)
             {
-                await AwaitAndHandleCompletionAsync(inFlight, consumer, stoppingToken);
+                await AwaitAndHandleCompletionAsync(inFlight, consumer, CancellationToken.None);
             }
 
             consumer.Close();
+            consumer.Dispose();
+
             _logger.LogInformation("Kafka consumer closed");
+        }
+    }
+
+    private async Task<ProcessingOutcome> ProcessMessageAsync(
+        ConsumeResult<string, byte[]> result,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ExecuteWithRetryAsync(
+                () => HandleMessageAsync(result, cancellationToken),
+                cancellationToken);
+
+            return new ProcessingOutcome(result, null);
+        }
+        catch (OperationCanceledException)
+        {
+            return new ProcessingOutcome(result, null);
+        }
+        catch (Exception ex)
+        {
+            return new ProcessingOutcome(result, ex);
         }
     }
 
@@ -100,7 +137,9 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
 
         var completed = await Task.WhenAny(inFlight);
         inFlight.Remove(completed);
-        await HandleCompletionAsync(await completed, consumer, cancellationToken);
+
+        var outcome = await completed;
+        await HandleCompletionAsync(outcome, consumer, cancellationToken);
     }
 
     private async Task DrainCompletedAsync(
@@ -108,39 +147,19 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
         IConsumer<string, byte[]> consumer,
         CancellationToken cancellationToken)
     {
-        for (var index = inFlight.Count - 1; index >= 0; index--)
+        for (var i = inFlight.Count - 1; i >= 0; i--)
         {
-            var task = inFlight[index];
+            var task = inFlight[i];
+
             if (!task.IsCompleted)
             {
                 continue;
             }
 
-            inFlight.RemoveAt(index);
-            await HandleCompletionAsync(await task, consumer, cancellationToken);
+            inFlight.RemoveAt(i);
+            var outcome = await task;
+            await HandleCompletionAsync(outcome, consumer, cancellationToken);
         }
-    }
-
-    private Task<ProcessingOutcome> ProcessMessageAsync(
-        ConsumeResult<string, byte[]> result,
-        CancellationToken cancellationToken)
-    {
-        return Task.Run(async () =>
-        {
-            try
-            {
-                await ExecuteWithRetryAsync(() => HandleMessageAsync(result, cancellationToken), cancellationToken);
-                return new ProcessingOutcome(result, null);
-            }
-            catch (OperationCanceledException)
-            {
-                return new ProcessingOutcome(result, null);
-            }
-            catch (Exception ex)
-            {
-                return new ProcessingOutcome(result, ex);
-            }
-        }, CancellationToken.None);
     }
 
     private async Task ExecuteWithRetryAsync(Func<Task> action, CancellationToken cancellationToken)
@@ -218,6 +237,7 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
 
         var multiplier = Math.Pow(2, Math.Max(0, retryNumber));
         var delayMs = baseDelayMs * multiplier;
+
         return TimeSpan.FromMilliseconds(Math.Min(delayMs, int.MaxValue));
     }
 
@@ -254,7 +274,9 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
         }
     }
 
-    private Task HandleMessageAsync(ConsumeResult<string, byte[]> result, CancellationToken cancellationToken)
+    private Task HandleMessageAsync(
+        ConsumeResult<string, byte[]> result,
+        CancellationToken cancellationToken)
     {
         LogMessage(result);
         return Task.CompletedTask;
@@ -263,6 +285,7 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
     private void LogMessage(ConsumeResult<string, byte[]> result)
     {
         var payloadSize = result.Message.Value?.Length ?? 0;
+
         _logger.LogInformation(
             "Consumed message with key {Key} from partition {Partition} at offset {Offset} ({Bytes} bytes)",
             result.Message.Key,
@@ -271,12 +294,15 @@ public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, 
             payloadSize);
     }
 
-    private sealed record ProcessingOutcome(ConsumeResult<string, byte[]> Result, Exception? Exception);
+    private sealed record ProcessingOutcome(
+        ConsumeResult<string, byte[]> Result,
+        Exception? Exception);
 
     public override Task StopAsync(CancellationToken cancellationToken)
     {
         _consumer?.Close();
         _consumer?.Dispose();
+
         return base.StopAsync(cancellationToken);
     }
 }
