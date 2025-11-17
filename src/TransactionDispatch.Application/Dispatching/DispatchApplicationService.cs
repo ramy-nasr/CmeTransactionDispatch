@@ -1,176 +1,201 @@
+using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TransactionDispatch.Domain;
 using TransactionDispatch.Domain.Abstractions;
-using TransactionDispatch.Infrastructure.FileSystem;
 using TransactionDispatch.Infrastructure.Messaging;
 
 namespace TransactionDispatch.Application.Dispatching;
 
 public sealed class DispatchApplicationService : IDispatchApplicationService
 {
+    private const string JobMessageContentType = "application/vnd.transaction-dispatch.job+json";
+    private static readonly JsonSerializerOptions JobPayloadSerializerOptions = new(JsonSerializerDefaults.Web);
+
     private readonly IDispatchJobRepository _repository;
-    private readonly IFileDiscoveryService _fileDiscoveryService;
     private readonly IKafkaProducer _kafkaProducer;
     private readonly ILogger<DispatchApplicationService> _logger;
 
     public DispatchApplicationService(
         IDispatchJobRepository repository,
-        IFileDiscoveryService fileDiscoveryService,
         IKafkaProducer kafkaProducer,
         ILogger<DispatchApplicationService> logger)
     {
         _repository = repository;
-        _fileDiscoveryService = fileDiscoveryService;
         _kafkaProducer = kafkaProducer;
         _logger = logger;
     }
 
-    public async Task<DispatchJobId> DispatchTransactionsAsync(DispatchTransactionsCommand command, CancellationToken cancellationToken)
+    public async Task<DispatchJobId> DispatchTransactionsAsync(
+        DispatchTransactionsCommand command,
+        CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(command.FolderPath))
-        {
-            throw new ArgumentException("Folder path is required", nameof(command));
-        }
+        ArgumentNullException.ThrowIfNull(command);
 
-        var idempotencyKey = string.IsNullOrWhiteSpace(command.IdempotencyKey)
-            ? null
-            : command.IdempotencyKey.Trim();
-
-        if (idempotencyKey is not null)
+        var folderPath = NormalizeFolderPath(command.FolderPath);
+        var normalizedIdempotencyKey = NormalizeIdempotencyKey(command.IdempotencyKey);
+        if (normalizedIdempotencyKey is not null)
         {
-            var existing = await _repository.GetByIdempotencyKeyAsync(idempotencyKey, cancellationToken)
+            var existingJob = await _repository
+                .GetByIdempotencyKeyAsync(normalizedIdempotencyKey, cancellationToken)
                 .ConfigureAwait(false);
-            if (existing is not null)
+
+            if (existingJob is not null)
             {
-                return existing.Id;
+                _logger.LogInformation(
+                    "Dispatch job {JobId} already exists for idempotency key {IdempotencyKey}",
+                    existingJob.Id,
+                    normalizedIdempotencyKey);
+                return existingJob.Id;
             }
         }
 
-        var jobId = DispatchJobId.NewId();
-        var allowedExtensions = command.AllowedExtensions?.Count > 0
-            ? command.AllowedExtensions
-            : Array.Empty<string>();
-
-        var job = new DispatchJob(jobId, command.FolderPath, command.DeleteAfterSend, allowedExtensions, idempotencyKey);
+        var job = CreateJob(command, folderPath, normalizedIdempotencyKey);
         var added = await _repository.AddAsync(job, cancellationToken).ConfigureAwait(false);
         if (!added)
         {
-            if (idempotencyKey is null)
+            var conflictingJobId = await ResolveConflictingJobIdAsync(job, cancellationToken).ConfigureAwait(false);
+            if (conflictingJobId is null)
             {
-                throw new InvalidOperationException($"Job with id {jobId} already exists.");
+                throw new InvalidOperationException($"Failed to add dispatch job {job.Id}.");
             }
 
-            var existing = await _repository.GetByIdempotencyKeyAsync(idempotencyKey, cancellationToken)
-                .ConfigureAwait(false);
-            if (existing is null)
-            {
-                throw new InvalidOperationException($"Failed to add dispatch job for idempotency key '{idempotencyKey}'.");
-            }
-
-            return existing.Id;
+            return conflictingJobId;
         }
 
-        _ = Task.Run(() => ProcessJobAsync(job.Id, CancellationToken.None));
-
-        return jobId;
+        await PublishJobQueuedAsync(job, cancellationToken).ConfigureAwait(false);
+        return job.Id;
     }
 
-    public Task<DispatchJobSnapshot?> GetJobStatusAsync(DispatchJobId jobId, CancellationToken cancellationToken)
+    public Task<DispatchJobSnapshot?> GetJobStatusAsync(
+        DispatchJobId jobId,
+        CancellationToken cancellationToken)
     {
         return _repository.GetSnapshotAsync(jobId, cancellationToken);
     }
 
-    private async Task ProcessJobAsync(DispatchJobId jobId, CancellationToken cancellationToken)
+    private static DispatchJob CreateJob(
+        DispatchTransactionsCommand command,
+        string normalizedFolderPath,
+        string? idempotencyKey)
     {
-        DispatchJob? job = await _repository.GetAsync(jobId, cancellationToken).ConfigureAwait(false);
-        if (job is null)
-        {
-            return;
-        }
-
-        try
-        {
-            job.Start();
-            await _repository.UpdateAsync(job, cancellationToken).ConfigureAwait(false);
-
-            var files = await _fileDiscoveryService.FindFilesAsync(job, cancellationToken).ConfigureAwait(false);
-            if (files.Count == 0)
-            {
-                job.Complete();
-                await _repository.UpdateAsync(job, cancellationToken).ConfigureAwait(false);
-                return;
-            }
-
-            foreach (var file in files)
-            {
-                var success = await ProcessFileAsync(job, file, cancellationToken).ConfigureAwait(false);
-                job.RecordResult(success);
-                await _repository.UpdateAsync(job, cancellationToken).ConfigureAwait(false);
-            }
-
-            if (job.Progress.Failed > 0)
-            {
-                job.Fail($"{job.Progress.Failed} files failed to publish.");
-            }
-            else
-            {
-                job.Complete();
-            }
-
-            await _repository.UpdateAsync(job, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Job {JobId} failed", jobId);
-            job.Fail(ex.Message);
-            await _repository.UpdateAsync(job, cancellationToken).ConfigureAwait(false);
-        }
+        return new DispatchJob(
+            DispatchJobId.NewId(),
+            normalizedFolderPath,
+            command.DeleteAfterSend,
+            NormalizeAllowedExtensions(command.AllowedExtensions),
+            idempotencyKey);
     }
 
-    private async Task<bool> ProcessFileAsync(DispatchJob job, FileEntry file, CancellationToken cancellationToken)
+    private static string NormalizeFolderPath(string folderPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(folderPath, nameof(folderPath));
+
+        var trimmed = folderPath.Trim();
+        if (trimmed.Length == 0)
+        {
+            throw new ArgumentException("Folder path is required", nameof(folderPath));
+        }
+
+        return Path.EndsInDirectorySeparator(trimmed)
+            ? trimmed.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            : trimmed;
+    }
+
+    private static string? NormalizeIdempotencyKey(string? key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        return key.Trim();
+    }
+
+    private static IReadOnlyCollection<string> NormalizeAllowedExtensions(IReadOnlyCollection<string>? extensions)
+    {
+        if (extensions is null || extensions.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var normalized = extensions
+            .Select(extension => extension?.Trim())
+            .Where(extension => !string.IsNullOrEmpty(extension))
+            .Select(extension => extension![0] == '.' ? extension : $".{extension}")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return normalized.Length == 0 ? Array.Empty<string>() : normalized;
+    }
+
+    private async Task<DispatchJobId?> ResolveConflictingJobIdAsync(
+        DispatchJob candidate,
+        CancellationToken cancellationToken)
+    {
+        if (candidate.IdempotencyKey is not null)
+        {
+            var idempotentJob = await _repository
+                .GetByIdempotencyKeyAsync(candidate.IdempotencyKey, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (idempotentJob is not null)
+            {
+                return idempotentJob.Id;
+            }
+        }
+
+        var snapshot = await _repository.GetSnapshotAsync(candidate.Id, cancellationToken).ConfigureAwait(false);
+        return snapshot?.Id;
+    }
+
+    private async Task PublishJobQueuedAsync(DispatchJob job, CancellationToken cancellationToken)
     {
         try
         {
-            var payload = await File.ReadAllBytesAsync(file.FullPath, cancellationToken).ConfigureAwait(false);
+            var payload = JsonSerializer.SerializeToUtf8Bytes(
+                new DispatchJobQueuedPayload(
+                    job.Id.Value,
+                    job.FolderPath,
+                    job.DeleteAfterSend,
+                    job.AllowedExtensions,
+                    job.IdempotencyKey),
+                JobPayloadSerializerOptions);
+
+            var headers = new Dictionary<string, string>
+            {
+                ["job-id"] = job.Id.ToString()
+            };
+
+            if (!string.IsNullOrWhiteSpace(job.IdempotencyKey))
+            {
+                headers["idempotency-key"] = job.IdempotencyKey!;
+            }
+
             var message = new TransactionMessage(
-                file.Name,
+                job.Id.ToString(),
                 payload,
-                file.ContentType,
-                new Dictionary<string, string>
-                {
-                    ["source-file"] = file.FullPath,
-                    ["job-id"] = job.Id.ToString()
-                });
+                JobMessageContentType,
+                headers);
 
             await _kafkaProducer.ProduceAsync(message, cancellationToken).ConfigureAwait(false);
-
-            if (job.DeleteAfterSend)
-            {
-                TryDeleteFile(file.FullPath);
-            }
-
-            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to dispatch file {FilePath} for job {JobId}", file.FullPath, job.Id);
-            return false;
+            _logger.LogError(ex, "Failed to enqueue dispatch job {JobId}", job.Id);
+            throw;
         }
     }
 
-    private void TryDeleteFile(string path)
-    {
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to delete file {FilePath} after dispatch", path);
-        }
-    }
+    private sealed record DispatchJobQueuedPayload(
+        Guid JobId,
+        string FolderPath,
+        bool DeleteAfterSend,
+        IReadOnlyCollection<string> AllowedExtensions,
+        string? IdempotencyKey);
 }

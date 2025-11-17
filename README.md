@@ -32,11 +32,13 @@ consumers.
 2. The API forwards the request to the application service (or reuses the
    existing job when the idempotency key already exists) and returns the job
    identifier immediately.
-3. The application service starts processing the job: it discovers matching files
-   through the infrastructure file system adapter, publishes each file to Kafka
-   through the producer adapter, and tracks progress and outcomes in the
-   repository while optionally deleting files after successful sends.
-4. Clients query `GET /dispatch-status/{jobId}` to retrieve progress details.
+3. The application service stores the job metadata and publishes a dispatch job
+   message onto Kafka through the producer adapter instead of processing files
+   inline.
+4. A background worker subscribes to the Kafka job topic, receives job messages,
+   performs file discovery and publishing, and updates progress in the
+   repository.
+5. Clients query `GET /dispatch-status/{jobId}` to retrieve progress details.
 
 The background worker hosts a Kafka consumer that streams messages off the topic
 so downstream logic can plug in custom handlers.

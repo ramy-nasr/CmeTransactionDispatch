@@ -4,7 +4,6 @@ using Moq;
 using TransactionDispatch.Application.Dispatching;
 using TransactionDispatch.Domain;
 using TransactionDispatch.Domain.Abstractions;
-using TransactionDispatch.Infrastructure.FileSystem;
 using TransactionDispatch.Infrastructure.Messaging;
 using Xunit;
 
@@ -13,14 +12,12 @@ namespace TransactionDispatch.Tests;
 public class DispatchApplicationServiceTests
 {
     private readonly Mock<IDispatchJobRepository> _repository = new();
-    private readonly Mock<IFileDiscoveryService> _fileDiscovery = new();
     private readonly Mock<IKafkaProducer> _producer = new();
 
     [Fact]
-    public async Task DispatchTransactionsAsync_CreatesJobAndProcessesFiles()
+    public async Task DispatchTransactionsAsync_CreatesJobAndPublishesMessage()
     {
         DispatchJob? storedJob = null;
-        var discoveryCalled = new TaskCompletionSource<bool>();
 
         _repository
             .Setup(r => r.GetByIdempotencyKeyAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
@@ -32,24 +29,8 @@ public class DispatchApplicationServiceTests
             .ReturnsAsync(true);
 
         _repository
-            .Setup(r => r.GetAsync(It.IsAny<DispatchJobId>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(() => storedJob);
-
-        _repository
-            .Setup(r => r.UpdateAsync(It.IsAny<DispatchJob>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-
-        _repository
             .Setup(r => r.GetSnapshotAsync(It.IsAny<DispatchJobId>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((DispatchJobSnapshot?)null);
-
-        _fileDiscovery
-            .Setup(f => f.FindFilesAsync(It.IsAny<DispatchJob>(), It.IsAny<CancellationToken>()))
-            .Returns<DispatchJob, CancellationToken>((_, _) =>
-            {
-                discoveryCalled.TrySetResult(true);
-                return Task.FromResult<IReadOnlyCollection<FileEntry>>(Array.Empty<FileEntry>());
-            });
 
         _producer
             .Setup(p => p.ProduceAsync(It.IsAny<TransactionMessage>(), It.IsAny<CancellationToken>()))
@@ -57,7 +38,6 @@ public class DispatchApplicationServiceTests
 
         var sut = new DispatchApplicationService(
             _repository.Object,
-            _fileDiscovery.Object,
             _producer.Object,
             NullLogger<DispatchApplicationService>.Instance);
 
@@ -66,7 +46,13 @@ public class DispatchApplicationServiceTests
 
         jobId.Value.Should().NotBe(Guid.Empty);
         storedJob.Should().NotBeNull();
-        await discoveryCalled.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        _producer.Verify(
+            p => p.ProduceAsync(
+                It.Is<TransactionMessage>(m =>
+                    m.FileName == storedJob!.Id.ToString()
+                    && m.ContentType == "application/vnd.transaction-dispatch.job+json"),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     [Fact]
@@ -74,7 +60,6 @@ public class DispatchApplicationServiceTests
     {
         var sut = new DispatchApplicationService(
             _repository.Object,
-            _fileDiscovery.Object,
             _producer.Object,
             NullLogger<DispatchApplicationService>.Instance);
 
@@ -95,7 +80,6 @@ public class DispatchApplicationServiceTests
 
         var sut = new DispatchApplicationService(
             _repository.Object,
-            _fileDiscovery.Object,
             _producer.Object,
             NullLogger<DispatchApplicationService>.Instance);
 
@@ -104,5 +88,6 @@ public class DispatchApplicationServiceTests
 
         jobId.Should().Be(existingJobId);
         _repository.Verify(r => r.AddAsync(It.IsAny<DispatchJob>(), It.IsAny<CancellationToken>()), Times.Never);
+        _producer.Verify(p => p.ProduceAsync(It.IsAny<TransactionMessage>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 }
