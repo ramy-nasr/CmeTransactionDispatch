@@ -1,5 +1,3 @@
-using System;
-using System.Collections.Generic;
 using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -8,17 +6,11 @@ using TransactionDispatch.Worker.Configuration;
 
 namespace TransactionDispatch.Worker.Services;
 
-public sealed class KafkaConsumerWorker : BackgroundService
+public sealed class KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, ILogger<KafkaConsumerWorker> logger) : BackgroundService
 {
-    private readonly ILogger<KafkaConsumerWorker> _logger;
-    private readonly KafkaConsumerOptions _options;
+    private readonly ILogger<KafkaConsumerWorker> _logger = logger;
+    private readonly KafkaConsumerOptions _options = options.Value;
     private IConsumer<string, byte[]>? _consumer;
-
-    public KafkaConsumerWorker(IOptions<KafkaConsumerOptions> options, ILogger<KafkaConsumerWorker> logger)
-    {
-        _options = options.Value;
-        _logger = logger;
-    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -67,7 +59,6 @@ public sealed class KafkaConsumerWorker : BackgroundService
 
                 result = consumer.Consume(TimeSpan.FromMilliseconds(200));
 
-
                 if (result is null)
                 {
                     continue;
@@ -81,8 +72,9 @@ public sealed class KafkaConsumerWorker : BackgroundService
                 inFlight.Add(ProcessMessageAsync(result, stoppingToken));
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException ex)
         {
+            _logger.LogInformation("Kafka consumer closed {Error Message}", ex.Message);
         }
         finally
         {

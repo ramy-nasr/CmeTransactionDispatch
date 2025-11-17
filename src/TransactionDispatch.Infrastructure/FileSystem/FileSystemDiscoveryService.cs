@@ -1,4 +1,5 @@
 using TransactionDispatch.Domain;
+using TransactionDispatch.Domain.FileSystem;
 
 namespace TransactionDispatch.Infrastructure.FileSystem;
 

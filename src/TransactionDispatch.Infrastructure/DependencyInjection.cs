@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using TransactionDispatch.Domain.Abstractions;
+using TransactionDispatch.Domain.FileSystem;
+using TransactionDispatch.Domain.Messaging;
 using TransactionDispatch.Infrastructure.FileSystem;
 using TransactionDispatch.Infrastructure.Messaging;
 using TransactionDispatch.Infrastructure.Options;

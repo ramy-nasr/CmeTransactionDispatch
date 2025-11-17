@@ -1,4 +1,4 @@
-namespace TransactionDispatch.Infrastructure.Messaging;
+namespace TransactionDispatch.Domain.Messaging;
 
 using TransactionDispatch.Domain;
 

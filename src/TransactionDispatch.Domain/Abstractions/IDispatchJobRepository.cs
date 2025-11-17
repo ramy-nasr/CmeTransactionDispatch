@@ -1,5 +1,3 @@
-using TransactionDispatch.Domain;
-
 namespace TransactionDispatch.Domain.Abstractions;
 
 public interface IDispatchJobRepository

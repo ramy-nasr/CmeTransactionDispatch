@@ -1,9 +1,9 @@
-using System.IO;
 using Microsoft.Extensions.Logging;
+using System.IO;
 using TransactionDispatch.Domain;
 using TransactionDispatch.Domain.Abstractions;
-using TransactionDispatch.Infrastructure.FileSystem;
-using TransactionDispatch.Infrastructure.Messaging;
+using TransactionDispatch.Domain.FileSystem;
+using TransactionDispatch.Domain.Messaging;
 
 namespace TransactionDispatch.Application.Dispatching;
 
@@ -26,7 +26,7 @@ public sealed class DispatchApplicationService : IDispatchApplicationService
         _logger = logger;
     }
 
-    public async Task<DispatchJobId> DispatchTransactionsAsync(DispatchTransactionsCommand command, CancellationToken cancellationToken)
+    public async Task<DispatchJobId> DispatchTransactionsAsync(DispatchTransactionsCommand command, List<string> allowedExtensions, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(command.FolderPath))
         {
@@ -48,9 +48,6 @@ public sealed class DispatchApplicationService : IDispatchApplicationService
         }
 
         var jobId = DispatchJobId.NewId();
-        var allowedExtensions = command.AllowedExtensions?.Count > 0
-            ? command.AllowedExtensions
-            : Array.Empty<string>();
 
         var job = new DispatchJob(jobId, command.FolderPath, command.DeleteAfterSend, allowedExtensions, idempotencyKey);
         var added = await _repository.AddAsync(job, cancellationToken).ConfigureAwait(false);
