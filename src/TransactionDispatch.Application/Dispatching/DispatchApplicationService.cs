@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using System.IO;
 using TransactionDispatch.Domain;
 using TransactionDispatch.Domain.Abstractions;
 using TransactionDispatch.Infrastructure.Messaging;

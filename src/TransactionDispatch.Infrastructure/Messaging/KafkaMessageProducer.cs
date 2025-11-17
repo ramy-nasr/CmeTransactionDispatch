@@ -3,6 +3,7 @@ using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using TransactionDispatch.Domain;
+using TransactionDispatch.Domain.Messaging;
 using TransactionDispatch.Infrastructure.Options;
 
 namespace TransactionDispatch.Infrastructure.Messaging;

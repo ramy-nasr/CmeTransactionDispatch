@@ -1,9 +1,6 @@
-using System.Linq;
-using Microsoft.AspNetCore.OpenApi;
 using Microsoft.Extensions.Options;
 using TransactionDispatch.Api.Options;
 using TransactionDispatch.Application.Dispatching;
-using TransactionDispatch.Domain;
 using TransactionDispatch.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -21,7 +18,13 @@ builder.Services
         "AllowedExtensions entries must be non-empty when configured.")
     .ValidateOnStart();
 
-builder.Services.AddSingleton<IDispatchApplicationService, DispatchApplicationService>();
+builder.Services.AddSingleton<ILogger>(sp =>
+{
+    var factory = sp.GetRequiredService<ILoggerFactory>();
+    return factory.CreateLogger("Default");
+});
+
+builder.Services.AddScoped<IDispatchApplicationService, DispatchApplicationService>();
 
 var app = builder.Build();
 
@@ -33,58 +36,80 @@ if (app.Environment.IsDevelopment())
 
 app.MapHealthChecks("/health");
 
-app.MapPost("/dispatch-transactions", async (
+app.MapPost("/dispatch-transactions", static async (
     DispatchRequest request,
     IDispatchApplicationService service,
     IOptions<DispatchConfigurationOptions> dispatchOptions,
+    ILogger logger,
     CancellationToken cancellationToken) =>
 {
-    var configuredExtensions = dispatchOptions.Value.AllowedExtensions ?? new List<string>();
-    IReadOnlyCollection<string> allowedExtensions = (request.AllowedExtensions?.Count ?? 0) > 0
-        ? request.AllowedExtensions.ToArray()
-        : configuredExtensions.ToArray();
+    try
+    {
+        if (request == null)
+            return Results.BadRequest();
 
-    var command = new DispatchTransactionsCommand(
-        request.FolderPath,
-        request.DeleteAfterSend,
-        allowedExtensions,
-        request.IdempotencyKey);
-    var jobId = await service.DispatchTransactionsAsync(command, cancellationToken).ConfigureAwait(false);
-    return Results.Accepted($"/dispatch-status/{jobId}", new { jobId });
+
+        var configuredExtensions = dispatchOptions.Value.AllowedExtensions ?? new List<string>();
+
+        var command = new DispatchTransactionsCommand(
+            request.FolderPath,
+            request.DeleteAfterSend,
+            request.IdempotencyKey);
+        var jobId = await service.DispatchTransactionsAsync(command, configuredExtensions, cancellationToken).ConfigureAwait(false);
+        return Results.Accepted($"/dispatch-status/{jobId}", new { jobId });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError("Error occurred while dispatching transactions: {ErrorMessage}", ex.Message);
+        return Results.BadRequest();
+    }
 })
-.WithName("DispatchTransactions");
+.WithName("DispatchTransactions")
+.WithOpenApi();
 
 app.MapGet("/dispatch-status/{jobId:guid}", async (
     Guid jobId,
     IDispatchApplicationService service,
+    ILogger logger,
     CancellationToken cancellationToken) =>
 {
-    var snapshot = await service.GetJobStatusAsync(new(jobId), cancellationToken).ConfigureAwait(false);
-    if (snapshot is null)
+    try
     {
-        return Results.NotFound();
-    }
+        if (jobId == Guid.Empty)
+            return Results.BadRequest();
 
-    var progress = snapshot.Progress;
-    return Results.Ok(new DispatchStatusResponse(
-        snapshot.Id.Value,
-        snapshot.Status.ToString(),
-        $"{progress.Percentage:0.##}%",
-        progress.TotalFiles,
-        progress.Processed,
-        progress.Succeeded,
-        progress.Failed,
-        snapshot.CompletedAt,
-        snapshot.FailureReason));
+
+        var snapshot = await service.GetJobStatusAsync(new(jobId), cancellationToken).ConfigureAwait(false);
+        if (snapshot is null)
+            return Results.NotFound();
+
+
+        var progress = snapshot.Progress;
+        return Results.Ok(new DispatchStatusResponse(
+            snapshot.Id.Value,
+            snapshot.Status.ToString(),
+            $"{progress.Percentage:0.##}%",
+            progress.TotalFiles,
+            progress.Processed,
+            progress.Succeeded,
+            progress.Failed,
+            snapshot.CompletedAt,
+            snapshot.FailureReason));
+    }
+    catch (Exception ex)
+    {
+        logger.LogError("Error occurred while dispatching transactions: {ErrorMessage}", ex.Message);
+        return Results.BadRequest();
+    }
 })
-.WithName("GetDispatchStatus");
+.WithName("GetDispatchStatus")
+.WithOpenApi();
 
 app.Run();
 
 internal sealed record DispatchRequest(
     string FolderPath,
     bool DeleteAfterSend,
-    IReadOnlyCollection<string>? AllowedExtensions,
     string? IdempotencyKey
 );
 
